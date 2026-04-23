@@ -2,7 +2,129 @@
 
 set -e
 
-# DNS 模式：国内
+# 统一脚本入口：通过参数切换配置（CN/HK/17.30）
+PROFILE="auto"
+SELF_CHECK=0
+REMAINING_ARGS=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --profile=*)
+            PROFILE="${1#*=}"
+            shift
+            ;;
+        --dns-mode=cn)
+            PROFILE="cn"
+            shift
+            ;;
+        --dns-mode=global)
+            PROFILE="hk"
+            shift
+            ;;
+        --self-check)
+            SELF_CHECK=1
+            shift
+            ;;
+        *)
+            REMAINING_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# 恢复参数供原脚本菜单/命令解析继续使用
+set -- "${REMAINING_ARGS[@]}"
+
+detect_country_code_by_public_ip() {
+    local ip="" country=""
+    if command -v curl >/dev/null 2>&1; then
+        ip="$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+        [ -n "$ip" ] || ip="$(curl -4fsS --max-time 3 https://ifconfig.me 2>/dev/null || true)"
+        if [ -n "$ip" ]; then
+            country="$(curl -fsS --max-time 3 "https://ipapi.co/${ip}/country/" 2>/dev/null | tr -d '\r\n' || true)"
+            [ -n "$country" ] || country="$(curl -fsS --max-time 3 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\r\n' || true)"
+            [ -n "$country" ] || country="$(curl -fsS --max-time 3 https://ifconfig.co/country-iso 2>/dev/null | tr -d '\r\n' || true)"
+        fi
+    fi
+    echo "$country"
+}
+
+resolve_auto_profile() {
+    local cc=""
+    cc="$(detect_country_code_by_public_ip)"
+    case "$cc" in
+        CN|cn)
+            echo "cn"
+            ;;
+        '')
+            # 无法探测时默认走国外 DNS，避免误用国内 DNS 导致解析异常
+            echo "hk"
+            ;;
+        *)
+            echo "hk"
+            ;;
+    esac
+}
+
+if [ "$PROFILE" = "auto" ]; then
+    PROFILE="$(resolve_auto_profile)"
+    echo "🌍 自动识别 profile 结果: $PROFILE"
+fi
+
+case "$PROFILE" in
+    cn)
+        PROFILE_LABEL="CN 增强"
+        DNS_MODE_LABEL="国内"
+        PPP_DNS_1="223.5.5.5"
+        PPP_DNS_2="119.29.29.29"
+        DPD_DELAY=15
+        DPD_TIMEOUT=120
+        CONNECT_DELAY=5000
+        LCP_ECHO_ADAPTIVE=0
+        LCP_ECHO_INTERVAL=10
+        LCP_ECHO_FAILURE=30
+        KEEPALIVE_MODE="active"
+        ;;
+    hk)
+        PROFILE_LABEL="HK 增强"
+        DNS_MODE_LABEL="国外"
+        PPP_DNS_1="8.8.8.8"
+        PPP_DNS_2="1.1.1.1"
+        DPD_DELAY=15
+        DPD_TIMEOUT=120
+        CONNECT_DELAY=5000
+        LCP_ECHO_ADAPTIVE=0
+        LCP_ECHO_INTERVAL=10
+        LCP_ECHO_FAILURE=30
+        KEEPALIVE_MODE="active"
+        ;;
+    17.30)
+        PROFILE_LABEL="17.30 稳定"
+        DNS_MODE_LABEL="国外"
+        PPP_DNS_1="8.8.8.8"
+        PPP_DNS_2="1.1.1.1"
+        DPD_DELAY=30
+        DPD_TIMEOUT=300
+        CONNECT_DELAY=10000
+        LCP_ECHO_ADAPTIVE=1
+        LCP_ECHO_INTERVAL=30
+        LCP_ECHO_FAILURE=20
+        KEEPALIVE_MODE="disabled"
+        ;;
+    *)
+        echo "❌ 不支持的 profile: $PROFILE（支持: auto / cn / hk / 17.30）" >&2
+        exit 1
+        ;;
+esac
+
+if [ "$LCP_ECHO_ADAPTIVE" -eq 1 ]; then
+    LCP_ADAPTIVE_LINE="lcp-echo-adaptive
+"
+else
+    LCP_ADAPTIVE_LINE=""
+fi
+
+# 生效配置：${PROFILE_LABEL}（DNS: ${DNS_MODE_LABEL}）
 
 # ===== 基础文件路径（沿用 l2tp10-2） =====
 VPN_USER_FILE="/etc/ppp/chap-secrets"
@@ -33,8 +155,8 @@ VPN_IP_POOL_START=10
 VPN_IP_POOL_END=100
 
 # ===== 基础环境检测 =====
-WAN_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-IP=$(hostname -I | awk '{print $1}')
+WAN_IFACE="$(ip route 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
+IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 
 get_ssh_port() {
     local port=""
@@ -633,11 +755,16 @@ CONNECT_TIME="$(date +%s)"
 exec 9>"$HOOK_LOCK_FILE"
 flock -x 9 || exit 0
 
-awk -F'	' -v u="$USER_NAME" '$1!=u {print $0}' "$STATE_FILE" 2>/dev/null > "${STATE_FILE}.tmp" || true
+awk -F'	' -v u="$USER_NAME" -v i="$IF_NAME" -v r="$REMOTE_IP" '
+  BEGIN{OFS="\t"}
+  $1==u {next}
+  $2==i {next}
+  (r!="" && $3==r) {next}
+  {print $0}
+' "$STATE_FILE" 2>/dev/null > "${STATE_FILE}.tmp" || true
 {
   cat "${STATE_FILE}.tmp" 2>/dev/null || true
-  printf "%s	%s	%s	%s	%s
-" "$USER_NAME" "$IF_NAME" "$REMOTE_IP" "$LOCAL_IP" "$CONNECT_TIME"
+  printf "%s\t%s\t%s\t%s\t%s\n" "$USER_NAME" "$IF_NAME" "$REMOTE_IP" "$LOCAL_IP" "$CONNECT_TIME"
 } > "$STATE_FILE"
 rm -f "${STATE_FILE}.tmp"
 chmod 600 "$STATE_FILE" || true
@@ -649,6 +776,8 @@ set -e
 STATE_FILE="/etc/ppp/l2tp-session-state.conf"
 HOOK_LOCK_FILE="/run/l2tp-hook.lock"
 USER_NAME="${PEERNAME:-}"
+IF_NAME="${IFNAME:-${PPP_IFACE:-}}"
+REMOTE_IP="${IPREMOTE:-}"
 [ -f "$STATE_FILE" ] || exit 0
 
 mkdir -p /run
@@ -656,7 +785,13 @@ mkdir -p /run
 exec 9>"$HOOK_LOCK_FILE"
 flock -x 9 || exit 0
 
-awk -F'	' -v u="$USER_NAME" '$1!=u {print $0}' "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+awk -F'	' -v u="$USER_NAME" -v i="$IF_NAME" -v r="$REMOTE_IP" '
+  BEGIN{OFS="\t"}
+  (i!="" && $2==i) {next}
+  (r!="" && $3==r) {next}
+  (i=="" && r=="" && u!="" && $1==u) {next}
+  {print $0}
+' "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
 mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
 chmod 600 "$STATE_FILE" || true
 EOF2
@@ -911,13 +1046,13 @@ show_rate_limit_rules() {
     done < "$RATE_LIMIT_FILE"
 }
 
-# ===== 增强功能：限速 =====# ===== 增强功能：限速 =====
+# ===== 增强功能：限速 =====
 rate_limit_apply() {
     local user="$1" mbit="$2" live_iface=""
     mkdir -p /etc/ppp/ip-up.d /etc/ppp/ip-down.d
     touch "$RATE_LIMIT_FILE"
 
-    grep -Ev "^[[:space:]]*${user}=" "$RATE_LIMIT_FILE" > "${RATE_LIMIT_FILE}.tmp" || true
+    awk -F= -v u="$user" '!(NF>=1 && $1==u)' "$RATE_LIMIT_FILE" > "${RATE_LIMIT_FILE}.tmp" 2>/dev/null || true
     if [ "$mbit" -gt 0 ]; then
         echo "${user}=${mbit}" >> "${RATE_LIMIT_FILE}.tmp"
     fi
@@ -1017,13 +1152,13 @@ prompt_rate_limit() {
 # ===== 增强功能：实时状态 =====
 show_user_realtime_status_once() {
     local now users user state exit_ip fixed_vpn_ip
-    local parsed=() live=() ifname="" vpn_ip="" local_ip="" connect_ts="" rx="" tx="" rx_speed="" tx_speed="" total_speed="" up_secs="" uptime="" conns=""
+    local parsed=() live=() ifname="" vpn_ip="" local_ip="" connect_ts="" rx="" tx="" rx_speed="" tx_speed="" total_speed="" total_used="" up_secs="" uptime="" conns=""
     now="$(date +%s)"
 
-    printf "%-16s %-7s %-8s %-15s %-15s %-12s %-12s %-12s %-6s %-10s
-"         "用户" "在线" "接口" "VPN_IP" "出口IP" "下载速率" "上传速率" "总速率" "连接" "在线时长"
-    printf "%-16s %-7s %-8s %-15s %-15s %-12s %-12s %-12s %-6s %-10s
-"         "----------------" "-------" "--------" "---------------" "---------------" "------------" "------------" "------------" "------" "----------"
+    printf "%-16s %-7s %-8s %-15s %-15s %-12s %-12s %-12s %-12s %-6s %-10s
+"         "用户" "在线" "接口" "VPN_IP" "出口IP" "下载速率" "上传速率" "总速率" "累计流量" "连接" "在线时长"
+    printf "%-16s %-7s %-8s %-15s %-15s %-12s %-12s %-12s %-12s %-6s %-10s
+"         "----------------" "-------" "--------" "---------------" "---------------" "------------" "------------" "------------" "------------" "------" "----------"
 
     users="$(list_existing_users)"
     [ -n "$users" ] || { echo "暂无用户"; return 0; }
@@ -1065,6 +1200,7 @@ show_user_realtime_status_once() {
                 rx_speed="${_rates[0]:-0B/s}"
                 tx_speed="${_rates[1]:-0B/s}"
                 total_speed="${_rates[2]:-0B/s}"
+                total_used="$(human_bytes "$((rx + tx))")"
                 up_secs=$((now - connect_ts))
                 [ "$up_secs" -lt 0 ] && up_secs=0
                 uptime="$(human_duration "$up_secs")"
@@ -1073,14 +1209,14 @@ show_user_realtime_status_once() {
                 else
                     conns="0"
                 fi
-                printf "%-16s %-7s %-8s %-15s %-15s %-12s %-12s %-12s %-6s %-10s
-"                     "$user" "yes" "$ifname" "$fixed_vpn_ip" "$exit_ip" "$rx_speed" "$tx_speed" "$total_speed" "$conns" "$uptime"
+                printf "%-16s %-7s %-8s %-15s %-15s %-12s %-12s %-12s %-12s %-6s %-10s
+"                     "$user" "yes" "$ifname" "$fixed_vpn_ip" "$exit_ip" "$rx_speed" "$tx_speed" "$total_speed" "$total_used" "$conns" "$uptime"
                 continue
             fi
         fi
 
-        printf "%-16s %-7s %-8s %-15s %-15s %-12s %-12s %-12s %-6s %-10s
-"             "$user" "no" "-" "$fixed_vpn_ip" "$exit_ip" "-" "-" "-" "0" "-"
+        printf "%-16s %-7s %-8s %-15s %-15s %-12s %-12s %-12s %-12s %-6s %-10s
+"             "$user" "no" "-" "$fixed_vpn_ip" "$exit_ip" "-" "-" "-" "-" "0" "-"
     done <<< "$users"
 }
 
@@ -1099,6 +1235,46 @@ show_user_realtime_status() {
 # ===== 增强功能：诊断 / 修复 / 报告 =====
 install_idle_keepalive() {
     mkdir -p /usr/local/sbin /etc/systemd/system
+
+    if [ "$KEEPALIVE_MODE" = "disabled" ]; then
+        cat > "$KEEPALIVE_SCRIPT" <<'EOF2'
+#!/bin/bash
+# 稳定优先：禁用外部 keepalive，避免状态文件不同步时误清会话
+exit 0
+EOF2
+        chmod +x "$KEEPALIVE_SCRIPT"
+
+        cat > "$KEEPALIVE_SERVICE" <<EOF2
+[Unit]
+Description=L2TP idle keepalive (disabled for stability-first mode)
+After=network-online.target xl2tpd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$KEEPALIVE_SCRIPT
+EOF2
+
+        cat > "$KEEPALIVE_TIMER" <<'EOF2'
+[Unit]
+Description=L2TP idle keepalive timer (disabled by default)
+
+[Timer]
+OnBootSec=1h
+OnUnitActiveSec=1h
+AccuracySec=1min
+Unit=l2tp-idle-keepalive.service
+
+[Install]
+WantedBy=timers.target
+EOF2
+
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl disable --now l2tp-idle-keepalive.timer >/dev/null 2>&1 || true
+        systemctl disable --now l2tp-idle-keepalive.service >/dev/null 2>&1 || true
+        return 0
+    fi
+
     cat > "$KEEPALIVE_SCRIPT" <<'EOF2'
 #!/bin/bash
 set -e
@@ -1281,7 +1457,7 @@ enhanced_menu() {
     done
 }
 
-# ===== 主管理菜单# ===== 主管理菜单（以 l2tp10-2 为主，增加增强菜单） =====
+# ===== 主管理菜单（以 l2tp10-2 为主，增加增强菜单） =====
 manage_menu() {
     while true; do
         echo "============== VPN 管理菜单 =============="
@@ -1327,8 +1503,12 @@ manage_menu() {
                     echo -n "🔎 输入要删除的用户序号: "; read -r del_index
                     if [[ "$del_index" =~ ^[0-9]+$ ]] && [ "$del_index" -ge 1 ] && [ "$del_index" -le "${#user_list[@]}" ]; then
                         del_user="${user_list[$((del_index-1))]}"
-                        sed -i "/^${del_user}[[:space:]]/d" "$VPN_USER_FILE"
-                        [ -f "$RATE_LIMIT_FILE" ] && sed -i "/^${del_user}=/d" "$RATE_LIMIT_FILE" || true
+                        awk -v u="$del_user" '!(NF>=1 && $1==u)' "$VPN_USER_FILE" > "${VPN_USER_FILE}.tmp" 2>/dev/null || true
+                        mv -f "${VPN_USER_FILE}.tmp" "$VPN_USER_FILE"
+                        if [ -f "$RATE_LIMIT_FILE" ]; then
+                            awk -F= -v u="$del_user" '!(NF>=1 && $1==u)' "$RATE_LIMIT_FILE" > "${RATE_LIMIT_FILE}.tmp" 2>/dev/null || true
+                            mv -f "${RATE_LIMIT_FILE}.tmp" "$RATE_LIMIT_FILE"
+                        fi
                         delete_public_ip_mapping "$del_user"
                         delete_user_vpn_ip_mapping "$del_user"
                         echo "✅ 用户 $del_user 已删除，相关出口公网 IP 与固定 VPN 地址绑定也已释放"
@@ -1377,22 +1557,57 @@ manage_menu() {
     done
 }
 
+run_self_check() {
+    local missing=0
+    echo "===================================="
+    echo "L2TP 脚本自检"
+    echo "===================================="
+    echo "当前 profile: ${PROFILE_LABEL} (${PROFILE})"
+    echo "DNS: ${PPP_DNS_1}, ${PPP_DNS_2}"
+    echo "DPD: delay=${DPD_DELAY}s timeout=${DPD_TIMEOUT}s"
+    echo "PPP: connect-delay=${CONNECT_DELAY} lcp-echo-interval=${LCP_ECHO_INTERVAL} lcp-echo-failure=${LCP_ECHO_FAILURE}"
+    echo "KEEPALIVE_MODE: ${KEEPALIVE_MODE}"
+    echo
+
+    for cmd in awk sed grep ip iptables systemctl; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "✅ 依赖检查: ${cmd}"
+        else
+            echo "⚠️ 依赖缺失: ${cmd}"
+            missing=1
+        fi
+    done
+
+    if [ -f "$VPN_USER_FILE" ] && [ -f "$IPSEC_CONF_FILE" ] && [ -f "$XL2TPD_CONF_FILE" ]; then
+        echo "✅ 检测到已安装配置文件（可进入管理菜单）"
+    else
+        echo "ℹ️ 未检测到完整安装配置（将走安装流程）"
+    fi
+
+    echo "===================================="
+    [ "$missing" -eq 0 ] && echo "自检完成：核心依赖已满足" || echo "自检完成：存在缺失依赖，请先补齐"
+    echo "===================================="
+}
+
 # 已安装则进入管理菜单
+if [ "$SELF_CHECK" -eq 1 ]; then
+    run_self_check
+    exit 0
+fi
+
 if vpn_installed; then
     install_public_ip_hooks
     install_session_state_hooks
-    if systemctl list-units --type=service 2>/dev/null | grep -qE 'ipsec|xl2tpd|strongswan'; then
-        manage_menu
-    fi
+    manage_menu
 fi
 
 # ===== 初始化安装部分（保留 l2tp10-2 为主） =====
 if [ "$OS" = "debian" ] || [ "$OS" = "ubuntu" ]; then
     apt update
-    apt install -y xl2tpd libreswan ppp iptables-persistent net-tools iproute2
+    apt install -y xl2tpd libreswan ppp iptables-persistent net-tools iproute2 curl
 elif [ "$OS" = "centos" ]; then
     yum install -y epel-release
-    yum install -y xl2tpd libreswan ppp iptables iptables-services net-tools iproute
+    yum install -y xl2tpd libreswan ppp iptables iptables-services net-tools iproute curl
 fi
 
 VPN_PSK=$(openssl rand -hex 8)
@@ -1427,8 +1642,8 @@ conn L2TP-PSK
     # DPD 调优：比旧版更积极探测，但仍保留一定容忍时间
     # 旧版是 clear/30/300；这里改成 hold/15/120，更接近“保活增强版”
     dpdaction=hold
-    dpddelay=15
-    dpdtimeout=120
+    dpddelay=${DPD_DELAY}
+    dpdtimeout=${DPD_TIMEOUT}
     ikev2=no
 EOF2
 
@@ -1454,8 +1669,8 @@ mkdir -p /etc/ppp
 cat > "$PPP_OPTIONS_FILE" <<EOF2
 ipcp-accept-local
 ipcp-accept-remote
-ms-dns 223.5.5.5
-ms-dns 119.29.29.29
+ms-dns ${PPP_DNS_1}
+ms-dns ${PPP_DNS_2}
 noccp
 auth
 refuse-eap
@@ -1469,7 +1684,7 @@ mtu 1400
 mru 1400
 proxyarp
 asyncmap 0
-connect-delay 5000
+connect-delay ${CONNECT_DELAY}
 novj
 nopcomp
 noaccomp
@@ -1480,9 +1695,9 @@ hide-password
 modem
 debug
 name l2tpd
-# PPP 保活：每 10 秒探测一次，连续失败 30 次才判定异常（约 5 分钟）
-lcp-echo-interval 10
-lcp-echo-failure 6
+# PPP 保活：统一按 profile 调整（增强版更积极；17.30 更稳）
+${LCP_ADAPTIVE_LINE}lcp-echo-interval ${LCP_ECHO_INTERVAL}
+lcp-echo-failure ${LCP_ECHO_FAILURE}
 EOF2
 
 DEFAULT_VPN_IP="10.50.60.10"
